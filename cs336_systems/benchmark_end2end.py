@@ -7,6 +7,7 @@ from typing import Tuple
 from pathlib import Path
 import yaml
 import pandas as pd
+import sys
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
@@ -86,36 +87,44 @@ def benchmark_model_end_to_end(
 
 def main():
     # Load configuration
-    config_path = Path("/root/assignment2-systems/configs/small.yaml")
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+    config_dir = Path(__file__).parent / "../configs"
+    results = []
 
-    # Initialize model
-    model = BasicsTransformerLM(
-        vocab_size=config["vocab_size"],
-        context_length=config["context_length"],
-        d_model=config["d_model"],
-        num_layers=config["num_layers"],
-        num_heads=config["num_heads"],
-        d_ff=config["d_ff"],
-        rope_theta=config["rope_theta"],
-    ).to(config["device"])
+    for file in config_dir.glob("*.yaml"):
+        model_name = file.stem
 
-    #model = torch.compile(model)
+        with open(file, "r") as f:
+            config = yaml.safe_load(f)
 
-    # Create random batch
-    x = get_random_batch(
-        config["batch_size"],
-        config["context_length"],
-        config["vocab_size"],
-        config["device"]
-    )
 
-    fwd_mean, fwd_std, bwd_mean, bwd_std =benchmark_model_end_to_end(model, x, config["forward_only"], config["warmup_steps"], config["repeats"], config["device"])
-    del model, x
-    torch.cuda.empty_cache()
-    df = pd.DataFrame(
-        [{
+        # Initialize model
+        model = BasicsTransformerLM(
+            vocab_size=config["vocab_size"],
+            context_length=config["context_length"],
+            d_model=config["d_model"],
+            num_layers=config["num_layers"],
+            num_heads=config["num_heads"],
+            d_ff=config["d_ff"],
+            rope_theta=config["rope_theta"],
+        ).to(config["device"])
+
+        #model = torch.compile(model)
+
+        # Create random batch
+        x = get_random_batch(
+            config["batch_size"],
+            config["context_length"],
+            config["vocab_size"],
+            config["device"]
+        )
+
+        fwd_mean, fwd_std, bwd_mean, bwd_std =benchmark_model_end_to_end(model, x, config["forward_only"], config["warmup_steps"], config["repeats"], config["device"])
+        del model, x
+        torch.cuda.empty_cache()
+
+
+        results.append({
+            "model": model_name,
             "d_model": config["d_model"],
             "d_ff": config["d_ff"],
             "num_layers": config["num_layers"],
@@ -126,9 +135,9 @@ def main():
             "Mean time bwd (s)": round(bwd_mean, 6) if not config["forward_only"] else None,
             "Std bwd (s)": round(bwd_std, 6) if not config["forward_only"] else None,
             "Warmup Steps": config["warmup_steps"],
-        }]
-    )
+        })
 
+    df = pd.DataFrame(results)
     print(df.to_markdown(index=False))
 
 if __name__ == "__main__":
