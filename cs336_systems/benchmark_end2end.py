@@ -86,7 +86,7 @@ def benchmark_model_end_to_end(
 
 def main():
     # Load configuration
-    config_path = Path("/root/assignment2-systems/configs/base_model.yaml")
+    config_path = Path("/root/assignment2-systems/configs/small.yaml")
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
@@ -129,7 +129,7 @@ def main():
         }]
     )
 
-    print(df)
+    print(df.to_markdown(index=False))
 
 if __name__ == "__main__":
     main()
