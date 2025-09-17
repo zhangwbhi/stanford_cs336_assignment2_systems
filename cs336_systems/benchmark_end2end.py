@@ -92,6 +92,7 @@ def main():
 
     for file in config_dir.glob("*.yaml"):
         model_name = file.stem
+        print(f"Benchmarking model: {model_name}")
 
         with open(file, "r") as f:
             config = yaml.safe_load(f)
@@ -107,8 +108,6 @@ def main():
             d_ff=config["d_ff"],
             rope_theta=config["rope_theta"],
         ).to(config["device"])
-
-        #model = torch.compile(model)
 
         # Create random batch
         x = get_random_batch(
