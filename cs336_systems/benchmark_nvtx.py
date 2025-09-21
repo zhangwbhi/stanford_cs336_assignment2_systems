@@ -1,6 +1,8 @@
 import timeit
 import torch
 import torch.nn as nn
+import torch.cuda.nvtx as nvtx
+
 import yaml
 from statistics import mean, stdev
 from typing import Tuple
@@ -10,7 +12,7 @@ import pandas as pd
 import sys
 import argparse
 
-from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.model import AnnotatedBasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
 
@@ -49,37 +51,51 @@ def benchmark_model_end_to_end(
     # Warm up
     print(f"Warmming up for {warmup_steps} times!")
 
-    for _ in range(warmup_steps):
-        y_ = model(x)
-        if not forward_only:
-            optimizer.zero_grad()
-            loss = cross_entropy(y_, x)
-            loss.backward()
-            optimizer.step()
-        if device == torch.device("cuda") or device == "cuda":
-            torch.cuda.synchronize()
+    with nvtx.range("Warmup"):
+        for _ in range(warmup_steps):
+            y_ = model(x)
+            if not forward_only:
+                optimizer.zero_grad()
+                loss = cross_entropy(y_, x)
+                loss.backward()
+                optimizer.step()
+
 
     # Benchmarking
     print(f"Benchmarking for {repeats} times!")
     forward_times = []
     backward_times =[]
 
-    for _ in range(repeats):
+    for step in range(repeats):
+        nvtx.range_push(f"Step-{step}")
         start_time = timeit.default_timer()
+        nvtx.range_push(f"Forward pass")
         y_ = model(x)
-        if device == torch.device("cuda") or device == "cuda":
-            torch.cuda.synchronize()
+        nvtx.range_pop()
         forward_times.append(timeit.default_timer() - start_time)
 
         if not forward_only:
             start_time = timeit.default_timer()
+
+            nvtx.range_push(f"Backward pass")
             optimizer.zero_grad()
+
+            nvtx.range_push(f"Calc loss")
             loss = cross_entropy(y_, x)
+            nvtx.range_pop()
+
+            nvtx.range_push("Back prop")
             loss.backward()
+            nvtx.range_pop()
+
+            nvtx.range_push("Weights update")
             optimizer.step()
-            if device == torch.device("cuda") or device == "cuda":
-                torch.cuda.synchronize()
+            nvtx.range_pop()
+
+            nvtx.range_pop()
             backward_times.append(timeit.default_timer() - start_time)
+
+        nvtx.range_pop()
     return mean(forward_times), stdev(forward_times), mean(backward_times) if not forward_only else None, stdev(backward_times) if not forward_only else None
 
 
@@ -104,19 +120,21 @@ def main():
 
     shared_params = model_configs["shared_parameters"]
     for model_name in model_configs["models"]:
+        nvtx.range_push(f"{model_name}")
         config = model_configs["models"][model_name]
         print(f"Benchmarking model: {model_name}")
 
         # Initialize model
-        model = BasicsTransformerLM(
-            vocab_size=shared_params["vocab_size"],
-            context_length=shared_params["context_length"],
-            d_model=config["d_model"],
-            num_layers=config["num_layers"],
-            num_heads=config["num_heads"],
-            d_ff=config["d_ff"],
-            rope_theta=shared_params["rope_theta"],
-        ).to(shared_params["device"])
+        with nvtx.range("Define model"):
+            model = AnnotatedBasicsTransformerLM(
+                vocab_size=shared_params["vocab_size"],
+                context_length=shared_params["context_length"],
+                d_model=config["d_model"],
+                num_layers=config["num_layers"],
+                num_heads=config["num_heads"],
+                d_ff=config["d_ff"],
+                rope_theta=shared_params["rope_theta"],
+            ).to(shared_params["device"])
 
         # Create random batch
         x = get_random_batch(
@@ -126,7 +144,8 @@ def main():
             shared_params["device"]
         )
 
-        fwd_mean, fwd_std, bwd_mean, bwd_std =benchmark_model_end_to_end(model, x, shared_params["forward_only"], shared_params["warmup_steps"], shared_params["repeats"], shared_params["device"])
+        fwd_mean, fwd_std, bwd_mean, bwd_std = benchmark_model_end_to_end(model, x, shared_params["forward_only"], shared_params["warmup_steps"], shared_params["repeats"], shared_params["device"])
+        nvtx.range_pop()
         del model, x
         torch.cuda.empty_cache()
 
