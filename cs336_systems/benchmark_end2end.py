@@ -11,7 +11,8 @@ import sys
 import argparse
 from contextlib import nullcontext
 import itertools
-
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 32
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
@@ -60,7 +61,7 @@ def benchmark_model_end_to_end(
             y_ = model(x)
             if not forward_only:
                 optimizer.zero_grad()
-                loss = cross_entropy(y_, x)
+                loss = y_.mean()
                 loss.backward()
                 optimizer.step()
             if device == torch.device("cuda") or device == "cuda":
@@ -91,7 +92,7 @@ def benchmark_model_end_to_end(
 
             start_time = timeit.default_timer()
             optimizer.zero_grad()
-            loss = cross_entropy(y_, x)
+            loss = y_.mean()
             loss.backward()
             optimizer.step()
             if device == torch.device("cuda") or device == "cuda":
@@ -130,7 +131,7 @@ def main():
 
     shared_params = model_configs["shared_parameters"]
 
-    for model_name, autocast in itertools.product(model_configs["models"], [True, False]):
+    for model_name, autocast, enable_compile in itertools.product(model_configs["models"], [True, False], [True, False]):
         config = model_configs["models"][model_name]
         print(f"Benchmarking model: {model_name}")
         torch.cuda.empty_cache()
@@ -145,6 +146,9 @@ def main():
             d_ff=config["d_ff"],
             rope_theta=shared_params["rope_theta"],
         ).to(shared_params["device"])
+
+        if enable_compile:
+            model = torch.compile(model)
 
         # Create random batch
         x = get_random_batch(
@@ -175,7 +179,8 @@ def main():
             "Memory after bwd (GB)": mem_after_bwd_mean,
 
             "Warmup Steps": shared_params["warmup_steps"],
-            "autocast": autocast
+            "autocast": autocast,
+            "compile": enable_compile,
         })
 
     df = pd.DataFrame(results)
