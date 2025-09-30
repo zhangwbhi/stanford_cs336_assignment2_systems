@@ -81,6 +81,81 @@ class FlashAttention2(torch.autograd.Function):
         return grad_Q, grad_K, grad_V, None
 
 
+@triton.jit
+def _flash_fwd_inner_kernel(
+    output, l, m,
+    queries, Kt_ptr_base, V_ptr_base,
+    stride_kd, stride_kk,
+    stride_vk, stride_vd,
+    N_KEYS, D,
+    scale,
+    query_tile_index: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    stage: tl.constexpr
+):
+
+    # causal: handles K/V blocks to the left of the diagonal blocks
+    if stage == 1:
+        lo, hi = 0, query_tile_index * Q_TILE_SIZE
+    # causal: handles diagonal blocks
+    elif stage == 2:
+        lo, hi = query_tile_index * Q_TILE_SIZE, (query_tile_index + 1) * Q_TILE_SIZE
+    # non causal
+    else:
+        lo, hi = 0, N_KEYS
+
+    # making K/V block ptrs in the inner kernek to avoid passing block ptrs between triton kernels (causing compiler error)
+    Kt_block_ptr = tl.make_block_ptr(
+        Kt_ptr_base,
+        shape=(D, N_KEYS),
+        strides=(stride_kd, stride_kk),
+        offsets=(0, 0),
+        block_shape=(D, K_TILE_SIZE),
+        order=(0, 1),
+    )
+    Kt_block_ptr = Kt_block_ptr.advance((0, K_TILE_SIZE * (lo // K_TILE_SIZE)))
+
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr_base,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    V_block_ptr = V_block_ptr.advance((K_TILE_SIZE * (lo // K_TILE_SIZE), 0))
+
+    q_offsets = Q_TILE_SIZE * query_tile_index + tl.arange(0, Q_TILE_SIZE)
+
+    for k_index in range(lo // K_TILE_SIZE, tl.cdiv(hi, K_TILE_SIZE)):
+        m_prev = m
+        keys_t = tl.load(Kt_block_ptr, boundary_check=(0, 1), padding_option="zero") # (D, K_TILE_SIZE)
+        values = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+
+        # S = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
+        S = tl.dot(queries, keys_t) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+
+        if stage == 2:
+            k_offsets = k_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            mask = q_offsets[:, None] < k_offsets[None, :]
+            S = tl.where(mask, - 1e6, S)
+
+
+        m = tl.maximum(tl.max(S, axis=-1), m_prev)
+        P = tl.math.exp(S - m[:, None])
+
+        corrector = tl.math.exp(m_prev - m)
+        l = corrector * l + tl.sum(P, axis=-1)
+
+        output = corrector[:, None] * output + tl.dot(P.to(values.dtype), values)
+
+        Kt_block_ptr = Kt_block_ptr.advance((0, K_TILE_SIZE))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+
+    return output, l, m
 
 
 @triton.jit
@@ -99,6 +174,8 @@ def flash_fwd_kernel(
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr
 ):
+    stage = 3 if is_causal else 1
+
     # Program indices
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
@@ -111,24 +188,6 @@ def flash_fwd_kernel(
         strides=(stride_qq, stride_qd),
         offsets=(query_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_index * stride_kb,
-        shape=(N_KEYS, D),
-        strides=(stride_kk, stride_kd),
-        offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_index * stride_vb,
-        shape=(N_KEYS, D),
-        strides=(stride_vk, stride_vd),
-        offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
 
@@ -151,38 +210,34 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
-    queries = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D)
-    q_offsets = Q_TILE_SIZE * query_tile_index + tl.arange(0, Q_TILE_SIZE)
-
     output = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
     l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m = tl.full((Q_TILE_SIZE,), - float("inf"), dtype=tl.float32)
+    queries = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D)
 
 
-    for k_index in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
-        m_prev = m
-        keys = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
-        values = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+    K_ptr_base = K_ptr + batch_index * stride_kb
+    V_ptr_base = V_ptr + batch_index * stride_vb
 
-        # S = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
-        S = tl.dot(queries, tl.trans(keys)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+    if stage == 1 or stage == 3:
+        output, l, m = _flash_fwd_inner_kernel(
+            output, l, m, queries, K_ptr_base, V_ptr_base,
+            stride_kd, stride_kk,
+            stride_vk, stride_vd,
+            N_KEYS, D,
+            scale,
+            query_tile_index, Q_TILE_SIZE, K_TILE_SIZE, 4 - stage
+        )
 
-        if is_causal:
-            k_offsets = k_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
-            mask = q_offsets[:, None] < k_offsets[None, :]
-            S = tl.where(mask, - 1e6, S)
-
-
-        m = tl.maximum(tl.max(S, axis=-1), m_prev)
-        P = tl.math.exp(S - m[:, None])
-
-        corrector = tl.math.exp(m_prev - m)
-        l = corrector * l + tl.sum(P, axis=-1)
-
-        output = corrector[:, None] * output + tl.dot(P.to(values.dtype), values)
-
-        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
-        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+    if stage == 3:
+        output, l, m = _flash_fwd_inner_kernel(
+            output, l, m, queries, K_ptr_base, V_ptr_base,
+            stride_kd, stride_kk,
+            stride_vk, stride_vd,
+            N_KEYS, D,
+            scale,
+            query_tile_index, Q_TILE_SIZE, K_TILE_SIZE, 2
+        )
 
 
     output /= l[:, None]
@@ -190,6 +245,7 @@ def flash_fwd_kernel(
 
     tl.store(O_block_ptr, output.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
     tl.store(L_block_ptr, logsum.to(L_block_ptr.type.element_ty), boundary_check=(0, ))
+
 
 
 
@@ -210,8 +266,8 @@ class TritonFlashAttention2(torch.autograd.Function):
         n_keys = K.size(1)
 
 
-        O = torch.empty(batch_size, n_queries, d_model, device=Q.device)
-        L = torch.empty(batch_size, n_queries, device=Q.device)
+        O = torch.empty(batch_size, n_queries, d_model, device=Q.device, dtype=Q.dtype)
+        L = torch.empty(batch_size, n_queries, device=Q.device, dtype=Q.dtype)
 
         assert Q.is_cuda and K.is_cuda and V.is_cuda, "Expected CUDA tensors"
         assert Q.is_contiguous() and K.is_contiguous() and V.is_contiguous(), "Our pointer arithmetic will assume contiguous Q, K, V"
