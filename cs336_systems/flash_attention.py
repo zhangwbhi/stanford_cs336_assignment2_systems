@@ -48,7 +48,7 @@ class FlashAttention2(torch.autograd.Function):
             Q_tile = Q[:, q_index * tile_size_q : (q_index + 1) * tile_size_q]
 
             l = torch.zeros(batch_size, tile_size_q)
-            m = torch.full((batch_size, tile_size_q,), float('-inf'))
+            m = torch.full((batch_size, tile_size_q,), float('-inf'), dtype=Q.dtype)
 
             for k_index in range(n_keys // tile_size_k):
                 m_prev = m
@@ -408,7 +408,7 @@ def flash_bwd_dQ(
         grad_P = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
         grad_P = tl.dot(grad_outputs, tl.trans(values), acc=grad_P)
         grad_S = P * (grad_P - d[:, None])
-        grad_queries = tl.dot(grad_S, tl.trans(keys_t), acc=grad_queries)
+        grad_queries = tl.dot(grad_S, tl.cast(tl.trans(keys_t), grad_S.dtype), acc=grad_queries)
 
         Kt_block_ptr = Kt_block_ptr.advance((0, K_TILE_SIZE))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
@@ -545,12 +545,12 @@ def flash_bwd_dKdV(
             mask = q_offsets[:, None] < k_offsets[None, :]
             P = tl.where(mask, 0.0, P)
 
-        grad_values = tl.dot(tl.trans(P), grad_outputs, acc=grad_values)
+        grad_values = tl.dot(tl.trans(P), tl.cast(grad_outputs, P.dtype), acc=grad_values)
 
         grad_P = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
         grad_P = tl.dot(grad_outputs, tl.trans(values), acc=grad_P)
         grad_S = P * (grad_P - d[:, None])
-        grad_keys = tl.dot(tl.trans(grad_S), queries, acc=grad_keys)
+        grad_keys = tl.dot(tl.trans(grad_S), tl.cast(queries, grad_S.dtype), acc=grad_keys)
 
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
         grad_O_block_ptr = grad_O_block_ptr.advance((Q_TILE_SIZE, 0))
